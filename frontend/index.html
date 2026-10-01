@@ -396,6 +396,67 @@
     border: 1px solid rgba(251, 191, 36, 0.3);
   }
 
+  .badge.needs_review {
+    background: rgba(59, 130, 246, 0.15);
+    color: #93c5fd;
+    border: 1px solid rgba(147, 197, 253, 0.35);
+  }
+
+  .ask-box {
+    margin-bottom: 16px;
+    padding: 12px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--hover);
+  }
+  .ask-box textarea {
+    width: 100%;
+    min-height: 56px;
+    background: var(--bg);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 8px;
+    font-size: 13px;
+    resize: vertical;
+  }
+  .ask-box button {
+    margin-top: 8px;
+    background: transparent;
+    color: var(--accent);
+    border: 1px solid var(--accent);
+    border-radius: 6px;
+    padding: 6px 12px;
+    cursor: pointer;
+    font-size: 12px;
+    font-weight: 600;
+  }
+  .ask-answer {
+    margin-top: 10px;
+    font-size: 12px;
+    color: var(--text);
+    line-height: 1.45;
+  }
+  .timeline {
+    margin-top: 14px;
+    padding-top: 10px;
+    border-top: 1px dashed var(--border);
+  }
+  .timeline-item {
+    display: flex;
+    gap: 10px;
+    font-size: 12px;
+    padding: 6px 0;
+    border-left: 2px solid var(--border);
+    margin-left: 6px;
+    padding-left: 12px;
+  }
+  .timeline-item .t-period {
+    color: var(--accent);
+    font-family: 'SF Mono', Monaco, monospace;
+    min-width: 70px;
+  }
+
   .rel-card strong {
     color: var(--text);
     font-size: 13px;
@@ -575,8 +636,14 @@
   </div>
 
   <div class="col col-right">
+    <h3>Ask (grounded RAG)</h3>
+    <div class="ask-box">
+      <textarea id="ask-input" placeholder="e.g. What was Delhivery revenue in FY2024?"></textarea>
+      <button id="ask-btn" type="button">Ask</button>
+      <div class="ask-answer" id="ask-answer"></div>
+    </div>
     <h3>Evidence & Relations</h3>
-    <div id="detail-panel"><div class="empty"><span class="icon">ℹ️</span> Click a fact to see its source quote and related facts.</div></div>
+    <div id="detail-panel"><div class="empty"><span class="icon">ℹ️</span> Click a fact to see Fact A → evidence → relationship → Fact B → evidence.</div></div>
   </div>
 </main>
 
@@ -657,7 +724,9 @@ function renderFacts(facts) {
 }
 
 function evidenceBlock(label, f, evidenceOverride) {
+  if (!f) return '<div class="empty">Fact unavailable.</div>';
   const quote = evidenceOverride && evidenceOverride.trim() ? evidenceOverride : f.quote;
+  const basis = f.reporting_basis || (f.is_reported_value === false ? "estimate" : "actual");
   return `
     <div class="ev-block">
       <div class="ev-label">${label}</div>
@@ -669,13 +738,37 @@ function evidenceBlock(label, f, evidenceOverride) {
         <span>📄 ${escapeHtml(f.document_id)}</span>
         <span>📖 p.${f.page_no}</span>
         <span>📅 ${escapeHtml(f.period || "n/a")}</span>
-        <span>🌐 ${escapeHtml(f.scope || "global")}</span>
+        <span>🌐 ${escapeHtml(f.scope || "unspecified")}</span>
+        <span>🗺 ${escapeHtml(f.geography || "n/a")}</span>
+        <span>📐 ${escapeHtml(basis)}</span>
         ${confidenceBadge(f)}
       </div>
       ${normalizedLine(f)}
       <div class="quote">📌 "${escapeHtml(quote)}"</div>
+      ${f.evidence_status && f.evidence_status !== "verified" ? `<div class="norm-line">evidence: ${escapeHtml(f.evidence_status)}${f.evidence_error ? " — " + escapeHtml(f.evidence_error) : ""}</div>` : ""}
     </div>
   `;
+}
+
+async function loadMetricTimeline(fact) {
+  const entity = encodeURIComponent(fact.entity || "");
+  const metric = encodeURIComponent(fact.norm_metric || fact.metric || "");
+  try {
+    const res = await fetch(`${API}/metrics/history?entity=${entity}&metric=${metric}`);
+    const rows = await res.json();
+    if (!rows.length) return "";
+    const items = rows.slice(0, 12).map(r => `
+      <div class="timeline-item">
+        <span class="t-period">${escapeHtml(r.norm_period || r.period || "n/a")}</span>
+        <span>${escapeHtml(String(r.norm_value ?? r.value))} ${escapeHtml(r.norm_unit || r.unit || "")}
+          <span style="color:var(--muted)"> · ${escapeHtml(r.document_id)} p.${r.page_no} · ${escapeHtml(r.scope || "")}</span>
+        </span>
+      </div>
+    `).join("");
+    return `<div class="timeline"><div class="ev-label">Metric history</div>${items}</div>`;
+  } catch (_) {
+    return "";
+  }
 }
 
 async function loadDetail(fact) {
@@ -688,29 +781,36 @@ async function loadDetail(fact) {
     </div>
     <div id="rel-loading" class="empty"><span class="loading"></span> Loading relations…</div>
   `;
+  const timelineHtml = await loadMetricTimeline(fact);
   const res = await fetch(`${API}/facts/${fact.id}/relations`);
   const relations = await res.json();
   const loading = document.getElementById("rel-loading");
+  if (timelineHtml) {
+    const wrap = document.createElement("div");
+    wrap.innerHTML = timelineHtml;
+    panel.appendChild(wrap.firstElementChild);
+  }
   if (!relations.length) {
     loading.innerHTML = '<span class="icon">⚠️</span> No cross-document relations found.';
     return;
   }
   loading.remove();
   relations.forEach(r => {
-    const o = r.other_fact;
+    const factA = r.fact_a || fact;
+    const factB = r.fact_b || r.other_fact;
     const relPct = (r.confidence !== null && r.confidence !== undefined) ? Math.round(r.confidence * 100) : null;
     const reason = r.reason && r.reason !== "none" ? r.reason.replace(/_/g, " ") : null;
     const el = document.createElement("div");
     el.className = "rel-card";
     el.innerHTML = `
-      ${evidenceBlock("FACT A (this fact)", fact, r.fact_a_evidence)}
+      ${evidenceBlock("FACT A → evidence", factA, r.fact_a_evidence)}
       <div class="rel-arrow">
         <span class="badge ${r.relation_type}">${escapeHtml(r.relation_type)}</span>
         ${relPct !== null ? `<span class="conf-badge">${relPct}% confidence</span>` : ''}
         ${reason ? `<span class="reason-badge">${escapeHtml(reason)}</span>` : ''}
       </div>
-      ${o ? evidenceBlock("FACT B (related)", o, r.fact_b_evidence) : '<div class="empty">Related fact unavailable.</div>'}
-      <div class="expl"><strong>Reasoning:</strong> ${escapeHtml(r.explanation)}</div>
+      ${factB ? evidenceBlock("FACT B → evidence", factB, r.fact_b_evidence) : '<div class="empty">Related fact unavailable.</div>'}
+      <div class="expl"><strong>Comparison / reason:</strong> ${escapeHtml(r.explanation)}</div>
     `;
     panel.appendChild(el);
   });
@@ -749,14 +849,21 @@ document.getElementById("pdf-input").addEventListener("change", async (e) => {
   const status = document.getElementById("upload-status");
   status.textContent = "";
   status.className = "status processing";
-  status.innerHTML = '<span class="loading"></span> Processing… this can take a minute.';
+  status.innerHTML = '<span class="loading"></span> Uploading / processing…';
 
   const formData = new FormData();
   formData.append("file", file);
 
   try {
-    const res = await fetch(`${API}/upload`, { method: "POST", body: formData });
+    // sync=true keeps the existing UX of waiting for facts; omit for pure async enqueue
+    const res = await fetch(`${API}/upload?sync=true`, { method: "POST", body: formData });
     const data = await res.json();
+    if (data.mode === "kafka" || data.status === "queued") {
+      status.textContent = `Queued job #${data.job_id}. Refresh documents shortly.`;
+      status.className = "status";
+      await loadDocuments();
+      return;
+    }
     status.textContent = `✅ Extracted ${data.facts_extracted} facts.`;
     status.className = "status";
     await loadDocuments();
@@ -764,6 +871,27 @@ document.getElementById("pdf-input").addEventListener("change", async (e) => {
   } catch (err) {
     status.textContent = "❌ Upload failed: " + err;
     status.className = "status error";
+  }
+});
+
+document.getElementById("ask-btn").addEventListener("click", async () => {
+  const q = document.getElementById("ask-input").value.trim();
+  const out = document.getElementById("ask-answer");
+  if (!q) return;
+  out.innerHTML = '<span class="loading"></span> Retrieving grounded facts…';
+  try {
+    const res = await fetch(`${API}/ask`, {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({question: q}),
+    });
+    const data = await res.json();
+    const cites = (data.cited_facts || []).slice(0, 5).map(f =>
+      `<div class="norm-line">[${f.id}] ${escapeHtml(f.entity)} ${escapeHtml(f.metric)}=${escapeHtml(f.value)} ${escapeHtml(f.unit||"")} (p.${f.page_no})</div>`
+    ).join("");
+    out.innerHTML = `<div>${escapeHtml(data.answer || "")}</div>${cites}`;
+  } catch (err) {
+    out.textContent = "Ask failed: " + err;
   }
 });
 

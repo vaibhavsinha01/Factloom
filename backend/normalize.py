@@ -243,6 +243,39 @@ def parse_numeric_value(value: str) -> float | None:
         return None
 
 
+_GEO_ALIASES = {
+    "india": "india",
+    "indian": "india",
+    "in": "india",
+    "us": "united_states",
+    "usa": "united_states",
+    "u.s.": "united_states",
+    "united states": "united_states",
+    "global": "global",
+    "worldwide": "global",
+    "domestic": "domestic",
+    "international": "international",
+}
+
+
+def canonical_geography(geo: str | None) -> str | None:
+    if not geo:
+        return None
+    key = geo.strip().lower()
+    return _GEO_ALIASES.get(key, _slugify(geo))
+
+
+def infer_currency(unit: str | None) -> str | None:
+    u = canonical_unit(unit)
+    if u.startswith("inr") or u in ("inr", "rs"):
+        return "INR"
+    if u.startswith("usd") or u in ("usd", "$"):
+        return "USD"
+    if u.startswith("eur"):
+        return "EUR"
+    return None
+
+
 def normalize_fact(fact: Fact) -> NormalizedFact | None:
     """Produce a NormalizedFact for a validated Fact. Returns None if the fact's value
     isn't numeric (non-numeric facts, e.g. qualitative status changes, aren't normalized
@@ -252,14 +285,18 @@ def normalize_fact(fact: Fact) -> NormalizedFact | None:
         logger.info("skipping numeric normalization for non-numeric fact id=%s value=%r", fact.id, fact.value)
         return None
 
+    unit = canonical_unit(fact.unit)
     return NormalizedFact(
         fact_id=fact.id,
-        entity=fact.entity.strip(),
+        entity=clean_entity(fact.entity) or fact.entity.strip(),
         metric=canonical_metric(fact.metric),
         value=numeric_value,
-        unit=canonical_unit(fact.unit),
+        unit=unit,
         period=canonical_period(fact.period),
         scope=(fact.scope or "unspecified").strip().lower(),
+        geography=canonical_geography(getattr(fact, "geography", None)),
+        currency=infer_currency(fact.unit),
+        reporting_basis=getattr(fact, "reporting_basis", None) or "actual",
         original_value=fact.value,
         original_unit=fact.unit,
     )

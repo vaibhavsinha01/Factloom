@@ -16,19 +16,24 @@ ONE measurement or claim about ONE entity for ONE period/scope — do not merge 
 or time periods into a single fact, and do not produce vague summaries ("the company performed
 well"). Ignore boilerplate, headers, footers, and page numbers.
 
+Preserve table context: when a number comes from a table, include the row/column headers that
+define its period, unit, and metric in the quote or period/unit fields.
+
 RULES
 1. Preserve exact numerical values EXACTLY as printed (keep original digits, commas, decimals).
-2. For every fact, identify: entity, metric, value, unit, period, scope.
+2. For every fact, identify: entity, metric, value, unit, period, scope, geography, reporting_basis.
 3. "quote" must be a verbatim substring of the chunk text that supports the fact — copy it
-   exactly, do not paraphrase or summarize it.
+   exactly, do not paraphrase or summarize it. Prefer a quote long enough to include nearby
+   unit/period context from a table header when relevant.
 4. "page_no" must be the single page (from the [page N] markers in the chunk) where the quote
-   actually appears. Never guess a page outside this chunk's range.
-5. Distinguish reported/actual values ("revenue was X") from commentary, forecasts, targets, or
-   management's forward-looking statements — set "is_reported_value" to false for the latter.
-6. Do NOT invent, infer, or hallucinate any field. If a field (unit, period, scope) is not
-   stated or clearly implied by context, use null. Never guess a value that is not in the text.
-7. Give each fact a "confidence": "high" (stated directly and unambiguously), "medium"
-   (requires minor inference, e.g. period implied by surrounding context), or "low" (uncertain).
+   actually appears. Never guess. If you cannot determine the page, still provide the best
+   page marker that contains the quote — do not invent a page outside this chunk's range.
+5. Set "reporting_basis" to "actual" for reported/historical figures, "estimate" for analyst
+   estimates (often marked with E), "forecast" for forward-looking projections, or "target"
+   for price targets / guidance targets. Also set "is_reported_value" true only for actuals.
+6. Do NOT invent, infer, or hallucinate any field. If a field (unit, period, scope, geography)
+   is not stated or clearly implied by table/context headers, use null.
+7. Give each fact a "confidence": "high", "medium", or "low".
 8. Skip the chunk entirely if it has no extractable facts — return {{"facts": []}}.
 
 OUTPUT
@@ -42,6 +47,8 @@ Return ONLY a JSON object with a "facts" key containing an array of objects with
       "unit": "..." | null,
       "period": "..." | null,
       "scope": "..." | null,
+      "geography": "..." | null,
+      "reporting_basis": "actual" | "estimate" | "forecast" | "target",
       "quote": "...",
       "page_no": 0,
       "is_reported_value": true,

@@ -1,194 +1,262 @@
 """
 Relationship classification:
-    FAISS retrieval → deterministic pre-check → LLM comparison → validate → store
+    hybrid retrieval → deterministic pre-check → LLM comparison → validate → store
 
-Architecture:
-    candidate pair
-         ↓
-    metadata comparison (same entity/metric/unit/period?)
-         ↓
-    numeric comparison (values within tolerance?)
-         ↓
-    obvious deterministic result?
-          /           \\
-        YES             NO
-         ↓               ↓
-    store result    LLM (Groq primary → Gemini fallback)
-                         ↓
-                    validate relation
-                         ↓
-                    store result
-
-Deterministic logic conserves LLM calls for cases that can be resolved structurally.
-LLM is used for semantic/contextual ambiguity only.
+Deterministic logic considers entity, metric, period, scope, geography, unit,
+currency, actual vs estimate, and reporting basis. Different periods/scopes/
+units/currencies/definitions must NOT automatically become contradictions.
 """
-import os
-import logging
+from __future__ import annotations
 
-from backend import store, llm, validate as val
-from backend.retrieve import retrieve_candidates
+import logging
+import os
+
+from backend import llm, store, validate as val
 from backend.models import Relation, RelationType, ReconcileReason
+from backend.normalize import clean_entity, canonical_unit
+from backend.retrieve import retrieve_candidates
 
 logger = logging.getLogger("factloom.compare")
 
 PROMPT_PATH = os.path.join(os.path.dirname(__file__), "prompts", "compare_facts.txt")
-with open(PROMPT_PATH) as f:
+with open(PROMPT_PATH, encoding="utf-8") as f:
     COMPARE_PROMPT = f.read()
 
-# Numeric tolerance for corroboration (1% relative difference)
 _CORROBORATE_TOLERANCE = 0.01
+
+# Unit families that are reconcilable via conversion rather than contradiction
+_CURRENCY_UNITS = {"inr", "rs", "usd", "$", "eur", "gbp"}
+_SCALE_INR = {"inr", "inr_lakh", "inr_crore", "inr_million", "inr_billion"}
+_SCALE_USD = {"usd", "usd_million", "usd_billion"}
+
+
+def _norm_scope(fact: dict) -> str:
+    s = (fact.get("norm_scope") or fact.get("scope") or "").strip().lower()
+    return "" if s in ("", "unspecified", "none", "null") else s
+
+
+def _norm_geo(fact: dict) -> str:
+    g = (fact.get("norm_geography") or fact.get("geography") or "").strip().lower()
+    return "" if g in ("", "unspecified", "none", "null", "n/a") else g
+
+
+def _reporting_basis(fact: dict) -> str:
+    rb = (fact.get("reporting_basis") or "").strip().lower()
+    if not rb:
+        # Infer from is_reported_value when present
+        irv = fact.get("is_reported_value")
+        if irv is False or irv == 0:
+            return "estimate"
+        return "actual"
+    if rb in ("reported",):
+        return "actual"
+    return rb
+
+
+def _units_compatible(ua: str, ub: str) -> tuple[bool, bool]:
+    """Return (compatible_same, reconcilable_via_unit_diff)."""
+    ua = (ua or "unitless").lower()
+    ub = (ub or "unitless").lower()
+    if ua == ub:
+        return True, False
+    if ua == "unitless" or ub == "unitless":
+        return True, False
+    if {ua, ub} <= {"inr", "rs"}:
+        return True, False
+    if {ua, ub} <= {"usd", "$"}:
+        return True, False
+    if {ua, ub} <= {"percent", "pct", "%"}:
+        return True, False
+    # Different currency or scale → reconcilable, not contradict
+    if (ua in _SCALE_INR and ub in _SCALE_USD) or (ua in _SCALE_USD and ub in _SCALE_INR):
+        return False, True
+    if (ua in _SCALE_INR and ub in _SCALE_INR and ua != ub) or (
+        ua in _SCALE_USD and ub in _SCALE_USD and ua != ub
+    ):
+        return False, True
+    if ua != ub:
+        return False, True
+    return False, False
 
 
 def _deterministic_compare(fact_a: dict, fact_b: dict) -> Relation | None:
-    """Attempt to classify the relationship between two facts without an LLM call.
+    """Classify when structurally obvious; return None to defer to LLM.
 
-    Returns a Relation if the classification can be made deterministically,
-    or None if the LLM should handle it.
-
-    Deterministic cases:
-    - Same entity + metric + unit + scope (if stated), numerically within 1% → CORROBORATES
-    - Same entity + metric + unit + scope (if stated), different period only → RECONCILABLE (different_reporting_period)
-    - Same entity + metric + unit + scope (if stated), same period, values differ >1% → RECONCILABLE (updated_information)
-    - Scope stated on both sides and differs → always deferred to the LLM (needs semantic judgment)
+    NEVER returns CONTRADICTS for period/scope/unit/currency/geography/basis mismatches.
+    Genuine contradictions require same entity+metric+period+scope+geo+basis+unit
+    with values that differ beyond tolerance — still deferred to LLM unless extremely clear,
+    except we DO return reconcilable/corroborates/unrelated/needs_review deterministically.
     """
-    from backend.normalize import clean_entity
     na, nb = fact_a.get("norm_metric"), fact_b.get("norm_metric")
-    ua, ub = fact_a.get("norm_unit"), fact_b.get("norm_unit")
+    ua = fact_a.get("norm_unit") or canonical_unit(fact_a.get("unit"))
+    ub = fact_b.get("norm_unit") or canonical_unit(fact_b.get("unit"))
     va, vb = fact_a.get("norm_value"), fact_b.get("norm_value")
     pa, pb = fact_a.get("norm_period"), fact_b.get("norm_period")
-    ea, eb = clean_entity(fact_a.get("entity")), clean_entity(fact_b.get("entity"))
-
-    # All required normalized fields must be present
-    if not all([na, ua, va is not None, vb is not None, ea, eb]):
-        return None
-
-    # Entities must match (canonical cleaned form)
-    if ea != eb:
-        return None
-
-    # Metrics must match
-    if na != nb:
-        return None
-
-    # Units must match (or one is unitless, or equivalent currencies)
-    units_match = (
-        (ua == ub)
-        or ua == "unitless"
-        or ub == "unitless"
-        or {ua, ub} <= {"inr", "rs"}
-        or {ua, ub} <= {"usd", "$"}
-    )
-    if not units_match:
-        return None
-
-    # Scope must match when both facts explicitly state one. Different scope (e.g.
-    # consolidated vs standalone, India vs global) is a common source of false
-    # "corroborates" calls — if both sides state a real scope and it differs, this needs
-    # semantic judgment (is a small value difference expected given the scope difference,
-    # or not?), so hand off to the LLM rather than deciding deterministically. Facts with
-    # no stated scope are normalized to "unspecified" (see normalize.py) and are not
-    # treated as a real scope value here, so two same-value facts where neither document
-    # mentions scope can still be resolved deterministically.
-    sa = (fact_a.get("norm_scope") or "").strip().lower()
-    sb = (fact_b.get("norm_scope") or "").strip().lower()
-    sa = "" if sa == "unspecified" else sa
-    sb = "" if sb == "unspecified" else sb
-    if sa and sb and sa != sb:
-        return None
+    ea = clean_entity(fact_a.get("norm_entity") or fact_a.get("entity"))
+    eb = clean_entity(fact_b.get("norm_entity") or fact_b.get("entity"))
 
     fid_a = fact_a.get("id", 0)
     fid_b = fact_b.get("id", 0)
 
-    # Numeric comparison
+    def _rel(rtype, conf, reason, explanation):
+        return Relation(
+            fact_a_id=fid_a,
+            fact_b_id=fid_b,
+            relation_type=rtype,
+            confidence=conf,
+            reason=reason,
+            explanation=explanation,
+            fact_a_evidence=fact_a.get("quote") or "",
+            fact_b_evidence=fact_b.get("quote") or "",
+        )
+
+    # Different entities → unrelated (unless one empty)
+    if ea and eb and ea != eb:
+        return _rel(
+            RelationType.UNRELATED, 0.9, ReconcileReason.NONE,
+            f"Different entities: '{ea}' vs '{eb}'.",
+        )
+
+    # Different metrics → unrelated
+    if na and nb and na != nb:
+        return _rel(
+            RelationType.UNRELATED, 0.85, ReconcileReason.NONE,
+            f"Different metrics: '{na}' vs '{nb}'.",
+        )
+
+    if not all([na, ua, va is not None, vb is not None, ea, eb]):
+        # Incomplete normalization — needs review rather than forced contradiction
+        if ea and eb and ea == eb and na and nb and na == nb:
+            return _rel(
+                RelationType.NEEDS_REVIEW, 0.4, ReconcileReason.NONE,
+                "Same entity/metric but incomplete numeric normalization; manual review needed.",
+            )
+        return None
+
+    if ea != eb or na != nb:
+        return None
+
+    sa, sb = _norm_scope(fact_a), _norm_scope(fact_b)
+    ga, gb = _norm_geo(fact_a), _norm_geo(fact_b)
+    ba, bb = _reporting_basis(fact_a), _reporting_basis(fact_b)
+
+    # Actual vs estimate / different reporting basis → reconcilable, never contradict
+    if ba and bb and ba != bb:
+        return _rel(
+            RelationType.RECONCILABLE, 0.88, ReconcileReason.ACTUAL_VS_ESTIMATE,
+            f"Same {ea} {na} but reporting basis differs: {ba} vs {bb}.",
+        )
+
+    # Geography mismatch
+    if ga and gb and ga != gb:
+        return _rel(
+            RelationType.RECONCILABLE, 0.9, ReconcileReason.DIFFERENT_GEOGRAPHY,
+            f"Same {ea} {na} but geography differs: {ga} vs {gb}.",
+        )
+
+    # Scope mismatch (both stated)
+    if sa and sb and sa != sb:
+        return _rel(
+            RelationType.RECONCILABLE, 0.9, ReconcileReason.DIFFERENT_SCOPE,
+            f"Same {ea} {na} but scope differs: {sa} vs {sb}.",
+        )
+
+    same_unit, unit_diff_reconcilable = _units_compatible(ua, ub)
+    if unit_diff_reconcilable and not same_unit:
+        a_inr = ua.startswith("inr") or ua in ("inr", "rs")
+        b_inr = ub.startswith("inr") or ub in ("inr", "rs")
+        a_usd = ua.startswith("usd") or ua in ("usd", "$")
+        b_usd = ub.startswith("usd") or ub in ("usd", "$")
+        reason = (
+            ReconcileReason.DIFFERENT_CURRENCY
+            if (a_inr and b_usd) or (a_usd and b_inr)
+            else ReconcileReason.DIFFERENT_UNIT
+        )
+        return _rel(
+            RelationType.RECONCILABLE, 0.9, reason,
+            f"Same {ea} {na} but units/currencies differ: {ua} vs {ub}.",
+        )
+
+    if not same_unit:
+        return None
+
     try:
         av, bv = float(va), float(vb)
     except (TypeError, ValueError):
-        return None
+        return _rel(
+            RelationType.NEEDS_REVIEW, 0.4, ReconcileReason.NONE,
+            "Non-numeric values could not be compared deterministically.",
+        )
 
     if av == 0 and bv == 0:
-        return None  # both zero — let LLM evaluate
+        return None
 
     max_val = max(abs(av), abs(bv))
     rel_diff = abs(av - bv) / max_val if max_val > 0 else 0.0
-
     periods_match = (pa == pb) or (not pa and not pb)
 
-    if rel_diff <= _CORROBORATE_TOLERANCE:
-        # Values are effectively the same
-        explanation = (
-            f"Both facts report {ea} {na} as {av} {ua}"
-            + (f" for {pa}" if pa else "")
-            + f" (relative difference: {rel_diff*100:.2f}%)."
-        )
-        return Relation(
-            fact_a_id=fid_a, fact_b_id=fid_b,
-            relation_type=RelationType.CORROBORATES,
-            confidence=0.95,
-            reason=ReconcileReason.NONE,
-            explanation=explanation,
+    if not periods_match and pa and pb:
+        return _rel(
+            RelationType.RECONCILABLE, 0.9, ReconcileReason.DIFFERENT_PERIOD,
+            f"Both report {ea} {na} for different periods: {pa} vs {pb}. Values: {av} vs {bv} {ua}.",
         )
 
-    if not periods_match and pa and pb:
-        # Same metric/unit, different periods → reconcilable by period
-        explanation = (
-            f"Both facts report {ea} {na} but for different periods: {pa} vs {pb}."
-            f" Values: {av} vs {bv} {ua}."
-        )
-        return Relation(
-            fact_a_id=fid_a, fact_b_id=fid_b,
-            relation_type=RelationType.RECONCILABLE,
-            confidence=0.85,
-            reason=ReconcileReason.DIFFERENT_PERIOD,
-            explanation=explanation,
+    if rel_diff <= _CORROBORATE_TOLERANCE:
+        return _rel(
+            RelationType.CORROBORATES, 0.95, ReconcileReason.NONE,
+            f"Both facts report {ea} {na} as {av} {ua}"
+            + (f" for {pa}" if pa else "")
+            + f" (relative difference: {rel_diff * 100:.2f}%).",
         )
 
     if periods_match and rel_diff > _CORROBORATE_TOLERANCE:
-        # Same period, same metric, values differ → updated information or definition difference
-        explanation = (
-            f"Both facts report {ea} {na} for {pa} but values differ: {av} vs {bv} {ua}"
-            f" (relative difference: {rel_diff*100:.1f}%). Likely updated or restated figures."
-        )
-        return Relation(
-            fact_a_id=fid_a, fact_b_id=fid_b,
-            relation_type=RelationType.RECONCILABLE,
-            confidence=0.75,
-            reason=ReconcileReason.UPDATED_INFORMATION,
-            explanation=explanation,
-        )
+        # Same period/scope/unit/basis — could be restatement OR genuine contradiction.
+        # Mild differences → updated_information; large differences → needs_review / LLM.
+        if rel_diff < 0.15:
+            return _rel(
+                RelationType.RECONCILABLE, 0.75, ReconcileReason.UPDATED_INFORMATION,
+                f"Both report {ea} {na} for {pa or 'same period'} but values differ slightly: "
+                f"{av} vs {bv} {ua} ({rel_diff * 100:.1f}%). Likely restatement/update.",
+            )
+        # Large gap with identical dimensions — defer to LLM for contradict vs restatement
+        return None
 
-    return None  # ambiguous — hand off to LLM
+    return None
 
 
 def compare_new_facts(new_facts: list[dict]):
-    """For each newly stored fact, retrieve candidates and classify relationships.
-    Stores validated relations only; skips 'unrelated' to avoid cluttering storage."""
+    """For each newly stored fact, retrieve candidates and classify relationships."""
     if not new_facts:
         return
 
-    all_facts = store.get_all_facts()
-
+    all_facts = store.get_all_facts(active_only=True)
     det_count = 0
     llm_count = 0
 
     for fact in new_facts:
+        if fact.get("evidence_status") == "unverifiable":
+            continue
         candidates = retrieve_candidates(fact, all_facts, k=5)
 
         for cand in candidates:
-            # Skip if this pair already has a stored relation
+            if cand.get("evidence_status") == "unverifiable":
+                continue
             existing = store.get_relations_for_fact(fact["id"])
             if any({r["fact_a_id"], r["fact_b_id"]} == {fact["id"], cand["id"]} for r in existing):
                 continue
 
-            # --- Deterministic pre-check ---
             det_relation = _deterministic_compare(fact, cand)
             if det_relation is not None:
                 det_count += 1
                 llm.increment_deterministic()
-                if det_relation.relation_type != RelationType.UNRELATED:
+                if det_relation.relation_type not in (RelationType.UNRELATED,):
                     store.add_relation(
                         fact["id"], cand["id"],
                         det_relation.relation_type.value, det_relation.explanation,
                         confidence=det_relation.confidence, reason=det_relation.reason.value,
+                        fact_a_evidence=det_relation.fact_a_evidence,
+                        fact_b_evidence=det_relation.fact_b_evidence,
+                        run_id=fact.get("run_id"),
                     )
                 logger.debug(
                     "deterministic: fact %s vs %s → %s",
@@ -196,22 +264,36 @@ def compare_new_facts(new_facts: list[dict]):
                 )
                 continue
 
-            # --- LLM comparison (only for ambiguous cases) ---
             llm_count += 1
             prompt = COMPARE_PROMPT.format(
                 doc_a=fact["document_id"], page_a=fact["page_no"],
                 entity_a=fact["entity"], metric_a=fact["metric"], value_a=fact["value"],
                 unit_a=fact["unit"] or "", period_a=fact["period"] or "unspecified",
-                scope_a=fact["scope"] or "unspecified", quote_a=fact["quote"],
+                scope_a=fact["scope"] or "unspecified",
+                geography_a=fact.get("geography") or "unspecified",
+                basis_a=_reporting_basis(fact),
+                quote_a=fact["quote"],
                 doc_b=cand["document_id"], page_b=cand["page_no"],
                 entity_b=cand["entity"], metric_b=cand["metric"], value_b=cand["value"],
                 unit_b=cand["unit"] or "", period_b=cand["period"] or "unspecified",
-                scope_b=cand["scope"] or "unspecified", quote_b=cand["quote"],
+                scope_b=cand["scope"] or "unspecified",
+                geography_b=cand.get("geography") or "unspecified",
+                basis_b=_reporting_basis(cand),
+                quote_b=cand["quote"],
             )
             try:
                 result = llm.generate_json(prompt, call_type="relation")
             except llm.LLMUnavailableError as e:
                 logger.error("compare failed for fact %s vs %s: %s", fact["id"], cand["id"], e)
+                store.add_relation(
+                    fact["id"], cand["id"],
+                    RelationType.NEEDS_REVIEW.value,
+                    f"LLM unavailable; flagged for review. ({e})",
+                    confidence=0.3, reason=ReconcileReason.NONE.value,
+                    fact_a_evidence=fact.get("quote") or "",
+                    fact_b_evidence=cand.get("quote") or "",
+                    run_id=fact.get("run_id"),
+                )
                 continue
 
             if not isinstance(result, dict):
@@ -223,13 +305,20 @@ def compare_new_facts(new_facts: list[dict]):
             relation = val.validate_relation(result)
             if relation is None:
                 continue
-            if relation.relation_type.value == "unrelated":
-                continue  # don't clutter storage with noise
+            if relation.relation_type == RelationType.UNRELATED:
+                continue
+
+            # Safety: never persist contradicts when dimensions clearly differ
+            if relation.relation_type == RelationType.CONTRADICTS:
+                guard = _deterministic_compare(fact, cand)
+                if guard is not None and guard.relation_type == RelationType.RECONCILABLE:
+                    relation = guard
 
             store.add_relation(
                 fact["id"], cand["id"], relation.relation_type.value, relation.explanation,
                 confidence=relation.confidence, reason=relation.reason.value,
                 fact_a_evidence=relation.fact_a_evidence, fact_b_evidence=relation.fact_b_evidence,
+                run_id=fact.get("run_id"),
             )
 
     logger.info(

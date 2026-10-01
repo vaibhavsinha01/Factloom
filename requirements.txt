@@ -9,3 +9,10 @@ numpy
 pydantic
 sentence-transformers
 faiss-cpu
+psycopg2-binary
+pgvector
+boto3
+kafka-python
+pyarrow
+pytest
+httpx

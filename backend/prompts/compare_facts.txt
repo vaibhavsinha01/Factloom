@@ -1,32 +1,32 @@
 You are comparing two facts extracted from different documents to determine their relationship.
 
 Fact A (from {doc_a}, page {page_a}):
-entity: {entity_a} | metric: {metric_a} | value: {value_a} {unit_a} | period: {period_a} | scope: {scope_a}
+entity: {entity_a} | metric: {metric_a} | value: {value_a} {unit_a} | period: {period_a} | scope: {scope_a} | geography: {geography_a} | reporting_basis: {basis_a}
 quote: "{quote_a}"
 
 Fact B (from {doc_b}, page {page_b}):
-entity: {entity_b} | metric: {metric_b} | value: {value_b} {unit_b} | period: {period_b} | scope: {scope_b}
+entity: {entity_b} | metric: {metric_b} | value: {value_b} {unit_b} | period: {period_b} | scope: {scope_b} | geography: {geography_b} | reporting_basis: {basis_b}
 quote: "{quote_b}"
 
 Classify the relationship as exactly one of:
 - "corroborates": both facts state the same underlying truth (same entity, metric, period,
-  scope, and value within rounding/unit-conversion tolerance), even if worded differently.
-- "contradicts": same entity, metric, period, AND scope, but genuinely different values that
-  cannot both be true simultaneously.
-- "reconcilable": the facts appear to differ or conflict at first glance, but the difference is
-  fully explained by a specific, identifiable reason (see reason list below).
-- "unrelated": not meaningfully comparable — different entities or different metrics with no
-  real overlap. Being about the same company/topic is NOT sufficient to call facts related;
-  they must describe the same underlying metric to be corroborates/contradicts/reconcilable.
+  scope, geography, reporting basis, and value within rounding/unit-conversion tolerance).
+- "contradicts": SAME entity, metric, period, scope, geography, AND reporting basis, but
+  genuinely different values that cannot both be true. NEVER contradict solely because
+  period, scope, unit, currency, geography, or actual-vs-estimate differs.
+- "reconcilable": apparent difference fully explained by an identifiable reason below.
+- "unrelated": different entities or different metrics with no real overlap.
+- "needs_review": ambiguous even after considering all dimensions — human review needed.
 
 If relation_type is "reconcilable", set "reason" to exactly one of:
 different_reporting_period, different_scope, different_definition, different_geography,
-different_unit, different_currency, updated_information, different_estimation_method
+different_unit, different_currency, updated_information, different_estimation_method,
+actual_vs_estimate, different_reporting_basis
 Otherwise set "reason" to "none".
 
 Return ONLY a JSON object with exactly these fields:
 {{
-  "relation_type": "corroborates" | "contradicts" | "reconcilable" | "unrelated",
+  "relation_type": "corroborates" | "contradicts" | "reconcilable" | "unrelated" | "needs_review",
   "confidence": 0.0,
   "reason": "...",
   "explanation": "One or two sentences of reasoning, citing the specific difference if relevant.",

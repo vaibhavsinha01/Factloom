@@ -24,9 +24,13 @@ class Fact(BaseModel):
     unit: Optional[str] = None
     period: Optional[str] = None
     scope: Optional[str] = None
+    geography: Optional[str] = None
+    reporting_basis: Optional[str] = "actual"  # actual | estimate | forecast | target
     quote: str = Field(min_length=1)
     confidence: str = "medium"
     numeric_confidence: float = 0.6
+    evidence_status: str = "pending"
+    evidence_error: Optional[str] = None
 
     @field_validator("confidence", mode="before")
     @classmethod
@@ -36,11 +40,26 @@ class Fact(BaseModel):
             return "medium"
         return s
 
+    @field_validator("reporting_basis", mode="before")
+    @classmethod
+    def _valid_reporting_basis(cls, v):
+        if v is None:
+            return "actual"
+        s = str(v).strip().lower()
+        if s in ("actual", "reported", "true"):
+            return "actual"
+        if s in ("estimate", "estimated", "e", "consensus"):
+            return "estimate"
+        if s in ("forecast", "projected", "guidance", "outlook"):
+            return "forecast"
+        if s in ("target", "tp"):
+            return "target"
+        return s if s else "actual"
+
     @field_validator("numeric_confidence", mode="before")
     @classmethod
     def _normalize_numeric_confidence(cls, v):
-        """Indicative 0-1 score, not a calibrated probability. Falls back to a
-        mapping from the qualitative label if no usable numeric value is present."""
+        """Indicative 0-1 score, not a calibrated probability."""
         try:
             f = float(v)
             if f != f:
@@ -56,14 +75,17 @@ class Fact(BaseModel):
 
 class NormalizedFact(BaseModel):
     id: Optional[int] = None
-    fact_id: Optional[int] = None  # filled in once the parent Fact is stored and has a DB id
+    fact_id: Optional[int] = None
     entity: str = Field(min_length=1)
-    metric: str = Field(min_length=1)          # canonical snake_case metric, e.g. "revenue_growth"
+    metric: str = Field(min_length=1)
     value: float
-    unit: str                                   # canonical unit, e.g. "percent", "inr_crore", "usd"
-    period: Optional[str] = None                # canonical period, e.g. "FY2024"
+    unit: str
+    period: Optional[str] = None
     scope: Optional[str] = None
-    original_value: str                          # preserved as-extracted, for provenance
+    geography: Optional[str] = None
+    currency: Optional[str] = None
+    reporting_basis: Optional[str] = "actual"
+    original_value: str
     original_unit: Optional[str] = None
 
 
@@ -102,6 +124,7 @@ class RelationType(str, Enum):
     CONTRADICTS = "contradicts"
     RECONCILABLE = "reconcilable"
     UNRELATED = "unrelated"
+    NEEDS_REVIEW = "needs_review"
 
 
 class ReconcileReason(str, Enum):
@@ -113,6 +136,8 @@ class ReconcileReason(str, Enum):
     DIFFERENT_CURRENCY = "different_currency"
     UPDATED_INFORMATION = "updated_information"
     DIFFERENT_ESTIMATION_METHOD = "different_estimation_method"
+    ACTUAL_VS_ESTIMATE = "actual_vs_estimate"
+    DIFFERENT_REPORTING_BASIS = "different_reporting_basis"
     NONE = "none"
 
 
@@ -130,17 +155,13 @@ class Relation(BaseModel):
     @field_validator("confidence", mode="before")
     @classmethod
     def _normalize_confidence(cls, v):
-        """Coerce whatever the LLM (or deterministic path) returns into a sensible
-        0-1 indicative score rather than rejecting the whole relation. Handles common
-        LLM slip-ups: percentages (0-100), out-of-range floats, strings, None."""
         try:
             f = float(v)
         except (TypeError, ValueError):
             return 0.5
-        if f != f:  # NaN
+        if f != f:
             return 0.5
         if 5.0 < f <= 100.0:
-            # Clearly given as a percentage (e.g. 85 instead of 0.85)
             f = f / 100.0
         return max(0.0, min(1.0, f))
 
@@ -148,6 +169,8 @@ class Relation(BaseModel):
     @classmethod
     def _coerce_relation_type(cls, v):
         s = str(v).strip().lower()
+        if "needs_review" in s or "review" in s:
+            return RelationType.NEEDS_REVIEW
         if "corroborat" in s:
             return RelationType.CORROBORATES
         if "contradict" in s:
@@ -162,6 +185,10 @@ class Relation(BaseModel):
         if not v:
             return ReconcileReason.NONE
         s = str(v).strip().lower().replace("-", "_").replace(" ", "_")
+        if "actual" in s and "estimat" in s:
+            return ReconcileReason.ACTUAL_VS_ESTIMATE
+        if "reporting_basis" in s or "basis" in s:
+            return ReconcileReason.DIFFERENT_REPORTING_BASIS
         if "period" in s:
             return ReconcileReason.DIFFERENT_PERIOD
         if "scope" in s:

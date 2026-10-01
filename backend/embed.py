@@ -298,9 +298,7 @@ def top_similar(new_fact: dict, candidate_facts: list[dict], k: int = 5, thresho
         if cand_emb is None:
             continue
         sim = cosine_sim(new_emb, cand_emb)
-        # Give a boost if normalized metrics match
-        if new_fact.get("norm_metric") and new_fact.get("norm_metric") == cand.get("norm_metric"):
-            sim = max(sim, 0.95)
+        # No artificial similarity boosting — metric preference belongs in retrieve.rerank
         if sim >= threshold:
             scored.append((sim, cand))
 

@@ -23,6 +23,7 @@ ENV/
 # Uploaded/generated files
 data/uploads/
 data/cache/
+data/lake/
 uploads/
 
 # IDE / OS
